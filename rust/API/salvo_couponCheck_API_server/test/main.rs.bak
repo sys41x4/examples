@@ -1,0 +1,181 @@
+//use reqwest;
+use reqwest::Client;
+use reqwest::blocking::get;
+use salvo::oapi::extract::*;
+use salvo::prelude::*;
+//use salvo_extra::query::serde_qs::DeserializeQs;
+use lazy_static::lazy_static;
+use std::collections::HashSet;
+use serde::Serialize;
+use serde::Deserialize;
+use csv::ReaderBuilder;
+use std::error::Error;
+use std::fs::File;
+use std::fs;
+use std::iter::FromIterator;
+// use std::path::Path;
+use tokio::runtime::Runtime;
+use tokio::task;
+
+// Dummy coupon list for demonstration purposes
+// const COUPON_LIST: [&str; 3] = ["COUPON1", "COUPON2", "COUPON3"];
+
+#[derive(serde::Deserialize)]
+struct ServerConfig {
+    coupon_code_fp: String,
+    coupon_code_remote_url_ep: String,
+    fetchable_column_name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct Config {
+    server: ServerConfig,
+}
+
+#[derive(Serialize)]
+struct CouponStatus {
+    coupon: String,
+    available: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CouponCodeRow {
+    coupon_code: String,
+}
+
+lazy_static! {
+    static ref CONFIG: Config = {
+        // Read the contents of config.toml
+        let config_content = fs::read_to_string("config/server.toml").expect("Failed to read server.toml");
+        // Parse the TOML configuration into the Config struct
+        toml::from_str(&config_content).expect("Failed to parse server.toml")
+    };
+}
+
+/* Fetch Coupon Codes From Local CSV File */
+/*
+lazy_static! {
+    static ref COUPON_LIST: HashSet<String> = match read_csv_file("/home/sys41x4/coupon_code_rows.csv") {
+        Ok(codes) => codes,
+        Err(err) => {
+            eprintln!("Error reading CSV file: {}", err);
+            HashSet::new()
+        }
+    };
+}
+*/
+
+
+fn read_csv_file(file_path: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
+
+    let mut coupon_codes = HashSet::new();
+    for result in rdr.deserialize() {
+        let record: CouponCodeRow = result?;
+        coupon_codes.insert(record.coupon_code);
+    }
+
+    Ok(coupon_codes)
+}
+
+
+/* Fetch Coupon Codes From Remote CSV File Endpoint */
+
+lazy_static! {
+    static ref COUPON_LIST: HashSet<String> = {
+        let server_config = &CONFIG.server;
+        let csv_data = Runtime::new().unwrap().block_on(fetch_csv_data_from_url(
+            &server_config.coupon_code_remote_url_ep,
+            &server_config.fetchable_column_name,
+        ))
+        .unwrap_or_default();
+        
+        HashSet::from_iter(csv_data)
+    };
+}
+
+async fn fetch_csv_data_from_url(url: &str, column_name: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let response = reqwest::get(url).await?;
+    let body = response.text().await?;
+
+    let mut csv_data = csv::Reader::from_reader(body.as_bytes());
+
+    let header = csv_data.headers()?.clone();
+
+    let mut result = Vec::new();
+
+    for record in csv_data.records() {
+        let record = record?;
+
+        if let Some(index) = header.iter().position(|col| col == column_name) {
+            if let Some(field) = record.get(index) {
+                result.push(field.to_string());
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/*#[endpoint]
+async fn coupon_check(coupon: QueryParam<String, false>) -> String {
+//    format!("Coupon, {}!", coupon.as_deref().unwrap_or("World"));
+    let coupon_str = coupon.as_deref().unwrap_or_default();
+
+    let is_available = COUPON_LIST.contains(&coupon_str.to_string());
+    let result = CouponStatus {
+        coupon: coupon_str.to_string(),
+        available: is_available,
+    };
+
+    serde_json::to_string(&result).unwrap()
+}
+*/
+
+
+
+#[endpoint]
+async fn coupon_check(query: &Option<QueryParam<String, false>>) -> Result<Handler, Error> {
+    let coupon_str = query
+        .as_ref()
+        .map(|coupon| coupon.as_str())
+        .unwrap_or_default();
+
+    let is_available = COUPON_LIST.contains(&coupon_str.to_string());
+    let result = CouponStatus {
+        coupon: coupon_str.to_string(),
+        available: is_available,
+    };
+
+    Ok(Handler::from(move |_| {
+        Ok(Response::new(StatusCode::OK, JSON(result.clone())))
+    }))
+}
+
+
+#[tokio::main]
+async fn main() {
+    // Read the contents of config.toml
+    let config_content = fs::read_to_string("config/server.toml").expect("Failed to read server.toml");
+
+    // Parse the TOML configuration into the Config struct
+    let config: Config = toml::from_str(&config_content).expect("Failed to parse config.toml");
+
+    let server_config = &config.server;
+
+    tracing_subscriber::fmt().init();
+
+//    println!("Coupon Codes: {:?}", *COUPON_LIST);
+
+    let router = Router::new().push(Router::with_path("api").get(coupon_check));
+
+    let doc = OpenApi::new("test api | Coupon Check API", "0.0.1").merge_router(&router);
+
+    let router = router
+        .push(doc.into_router("/api-doc/openapi.json"))
+        .push(SwaggerUi::new("/api-doc/openapi.json").into_router("swagger-ui"));
+
+    let acceptor = TcpListener::new("0.0.0.0:8091").bind().await;
+    Server::new(acceptor).serve(router).await;
+}

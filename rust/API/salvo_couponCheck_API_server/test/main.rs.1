@@ -1,0 +1,81 @@
+use salvo::oapi::extract::*;
+use salvo::prelude::*;
+use lazy_static::lazy_static;
+use std::collections::HashSet;
+use serde::Serialize;
+use serde::Deserialize;
+use csv::ReaderBuilder;
+use std::error::Error;
+use std::fs::File;
+// use std::path::Path;
+// use tokio::runtime::Runtime;
+
+// Dummy coupon list for demonstration purposes
+// const COUPON_LIST: [&str; 3] = ["COUPON1", "COUPON2", "COUPON3"];
+
+#[derive(Serialize)]
+struct CouponStatus {
+    coupon: String,
+    available: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CouponCodeRow {
+    coupon_code: String,
+}
+
+lazy_static! {
+    static ref COUPON_LIST: HashSet<String> = match read_csv_file("/home/sys41x4/coupon_code_rows.csv") {
+        Ok(codes) => codes,
+        Err(err) => {
+            eprintln!("Error reading CSV file: {}", err);
+            HashSet::new()
+        }
+    };
+}
+
+fn read_csv_file(file_path: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
+
+    let mut coupon_codes = HashSet::new();
+    for result in rdr.deserialize() {
+        let record: CouponCodeRow = result?;
+        coupon_codes.insert(record.coupon_code);
+    }
+
+    Ok(coupon_codes)
+}
+
+
+#[endpoint]
+async fn coupon_check(coupon: QueryParam<String, false>) -> String {
+//    format!("Coupon, {}!", coupon.as_deref().unwrap_or("World"));
+    let coupon_str = coupon.as_deref().unwrap_or_default();
+
+    let is_available = COUPON_LIST.contains(&coupon_str.to_string());
+    let result = CouponStatus {
+        coupon: coupon_str.to_string(),
+        available: is_available,
+    };
+
+    serde_json::to_string(&result).unwrap()
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+//    println!("Coupon Codes: {:?}", *COUPON_LIST);
+
+    let router = Router::new().push(Router::with_path("api").get(coupon_check));
+
+    let doc = OpenApi::new("test api | Coupon Check API", "0.0.1").merge_router(&router);
+
+    let router = router
+        .push(doc.into_router("/api-doc/openapi.json"))
+        .push(SwaggerUi::new("/api-doc/openapi.json").into_router("swagger-ui"));
+
+    let acceptor = TcpListener::new("0.0.0.0:8091").bind().await;
+    Server::new(acceptor).serve(router).await;
+}

@@ -1,0 +1,4 @@
+[server]
+coupon_code_fp = "/home/sys41x4/coupon_code_rows.csv"
+coupon_code_remote_url_ep = "https://sys41x4.github.io/examples/data/coupon_code_rows.csv"
+fetchable_column_name = "coupon_code"

@@ -1,0 +1,251 @@
+// use reqwest::blocking::get;
+use salvo::oapi::extract::*;
+use salvo::prelude::*;
+use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use csv::ReaderBuilder;
+use std::error::Error;
+use std::fs::File;
+use std::fs;
+use std::iter::FromIterator;
+// use tokio::runtime::Runtime;
+// use tokio::task::JoinHandle;
+use once_cell::sync::Lazy;
+use std::sync::{Arc, Mutex};
+use once_cell::sync::OnceCell;
+// use std::sync::MutexGuard;
+// use lazy_static::lazy_static;
+// use salvo::http::StatusCode;
+// use runtime::Builder::new_multi_thread;
+
+use async_std::task;
+//use tokio::task;
+use reqwest::blocking::Client;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CouponConfig {
+    coupon_code_fp: String,
+    coupon_code_remote_url_ep: String,
+    fetchable_column_name: String,
+}
+
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ServerConfig {
+    host: String,
+    port: u16,
+}
+
+#[derive(serde::Deserialize)]
+struct Config {
+    coupon_config: CouponConfig,
+    server: ServerConfig,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CouponStatus {
+    coupon: String,
+    available: bool,
+}
+
+static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| {
+    let config_content = fs::read_to_string("config/config.toml").expect("Failed to read config.toml");
+    let config: Config = toml::from_str(&config_content).expect("Failed to parse config.toml");
+    Mutex::new(config)
+});
+
+
+static COUPON_LIST: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+//#[tokio::test]
+async fn fetch_and_store_coupon_codes(url: &str, column_name: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let response = Client::new().get(url).send()?;
+    let response_text = response.text()?;
+
+    let mut rdr = ReaderBuilder::new().from_reader(response_text.as_bytes());
+
+    // Get the header row to find the index of the "coupon_code" column
+    let headers = rdr.headers()?.clone();
+    let coupon_code_index = headers.iter().position(|header| header == column_name);
+
+    let mut coupon_codes = HashSet::new(); // Create a HashSet to store the coupon codes
+
+    for result in rdr.records() {
+        let record = result?;
+        if let Some(index) = coupon_code_index {
+            if let Some(coupon_code) = record.get(index) {
+                coupon_codes.insert(coupon_code.to_string());
+            }
+        }
+    }
+
+    Ok(coupon_codes)
+}
+
+
+async fn read_csv_file(file_path: &str, column_name: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
+
+    let mut coupon_codes = HashSet::new();
+    
+    // Get the headers from the CSV reader
+    let headers = rdr.headers()?;
+    
+    // Find the index of the desired column name
+    let column_index = headers.iter().position(|header| header == column_name);
+    if let Some(index) = column_index {
+        for result in rdr.records() {
+            let record = result?;
+            // Use the column index to retrieve the value from the record
+            if let Some(coupon_code) = record.get(index) {
+                coupon_codes.insert(coupon_code.to_string());
+            }
+        }
+    } else {
+        return Err("Column name not found in CSV file.".into());
+    }
+
+    Ok(coupon_codes)
+}
+
+// Helper function to fetch the CSV data
+async fn init_coupon_list() -> HashSet<String> {
+    let coupon_config = {
+        let config = CONFIG.lock().unwrap();
+        config.coupon_config.clone() // Clone the CouponConfig inside the Mutex
+    };
+
+    match fetch_and_store_coupon_codes(
+        &coupon_config.coupon_code_remote_url_ep,
+        &coupon_config.fetchable_column_name,
+    )
+    .await
+    {
+        //Ok(result) => HashSet::from_iter(result),
+        Err(err) => {
+            eprintln!("Error fetching CSV data: {}", err);
+            HashSet::new()
+        }
+    }
+}
+
+
+async fn load_coupon_data_from_local() -> String {
+    let coupon_config = {
+        let config = CONFIG.lock().unwrap();
+        config.coupon_config.clone() // Clone the CouponConfig inside the Mutex
+    };
+
+    match read_csv_file(&coupon_config.coupon_code_fp, &coupon_config.fetchable_column_name).await {
+        Ok(coupon_list) => {
+            let mut coupon_list_guard = COUPON_LIST.lock().unwrap();
+            coupon_list_guard.clear(); // Clear the previous data
+            *coupon_list_guard = coupon_list;
+
+            println!("Total number of entries in COUPON_CODE_LIST | Local: {}", coupon_list_guard.len());
+            return "Coupon codes have been reloaded from local File.".to_string();
+        },
+        Err(err) => {
+            eprintln!("Error fetching CSV data: {}", err);
+            return "ERROR | Coupon codes have not been refreshed locally.".to_string();
+        }
+    }
+}
+
+#[endpoint]
+async fn coupon_check(coupon: QueryParam<String, false>) -> String {
+    let coupon_str = coupon.as_deref().unwrap_or_default();
+    // let is_available = COUPON_LIST.contains(&coupon_str.to_string());
+    //let coupon_list = init_coupon_list().await;
+    
+    // let is_available = coupon_list.contains(&coupon_str.to_string());
+    let is_available = {
+        let coupon_list = COUPON_LIST.lock().unwrap();
+        coupon_list.contains(&coupon_str.to_string())
+    };
+    let result = CouponStatus {
+        coupon: coupon_str.to_string(),
+        available: is_available,
+    };
+    serde_json::to_string(&result).unwrap()
+}
+
+#[endpoint]
+async fn coupon_refresh(refresh: QueryParam<String, false>) -> String {
+    let refresh_str = refresh.as_deref().unwrap_or_default();
+    // let is_available = COUPON_LIST.contains(&coupon_str.to_string());
+    //let coupon_list = init_coupon_list().await;
+    
+    // let is_available = coupon_list.contains(&coupon_str.to_string());
+    if refresh_str == "remote" {
+
+        let coupon_list = init_coupon_list().await;
+        let mut coupon_list_guard = COUPON_LIST.lock().unwrap();
+        coupon_list_guard.clear(); // Clear the previous data
+        *coupon_list_guard = coupon_list;
+
+        println!("Total number of entries in COUPON_CODE_LIST | Remote: {}", coupon_list_guard.len());
+
+        return "Coupon codes have been reloaded from the remote URL.".to_string();
+        //return format!("{} Coupon codes have been reloaded from the remote URL.", coupon_list_guard.to_string());
+    }
+    else if refresh_str == "local" {
+
+        let message = load_coupon_data_from_local().await;
+        return message;
+        
+    }
+
+    // Return some response if refresh is not equal to "remote"
+    "No action taken.".to_string()
+}
+
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    // Load CSV data from Remote URL endpoint
+    task::block_on(async {
+        
+        let coupon_list = init_coupon_list().await;
+        let mut coupon_list_guard = COUPON_LIST.lock().unwrap();
+        *coupon_list_guard = coupon_list;
+
+        // Print the list content
+        //println!("Coupon Codes: {:?}", *coupon_list_guard);
+
+        /* 
+        // Print the list content
+        let coupon_list = COUPON_CODES.lock().unwrap();
+        println!("Coupon Codes: {:?}", *coupon_list);
+        */
+        //let coupon_list = COUPON_CODES.lock().unwrap();
+        println!("Total number of entries in COUPON_CODE_LIST | Remote : {}", coupon_list_guard.len());
+    });
+   
+    // Coupon Check and refresh Endpoint
+    let router = Router::new()
+        .push(Router::with_path("api").get(coupon_check))
+        .push(Router::with_path("admin").get(coupon_refresh));
+
+    let doc = OpenApi::new("test api | Coupon Check API", "0.0.1").merge_router(&router);
+    let router = router
+        .push(doc.into_router("/api-doc/openapi.json"))
+        .push(SwaggerUi::new("/api-doc/openapi.json").into_router("swagger-ui"));
+    // let acceptor = TcpListener::new("0.0.0.0:8091").bind().await;
+
+    // Load Server Hosting Data from config file
+    let server_config = {
+        let config = CONFIG.lock().unwrap();
+        config.server.clone() // Clone the ServerConfig inside the Mutex
+    };
+
+    let addr = format!("{}:{}", server_config.host, server_config.port);
+    //let addr: SocketAddr = addr.parse().expect("Invalid address format");
+
+    let acceptor = TcpListener::new(&addr).bind().await;
+
+    Server::new(acceptor).serve(router).await;
+}

@@ -1,0 +1,22 @@
+[package]
+name = "salvo_coupon_check_api_server"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+async-std = "1.10.0"
+csv = "1.1.6"
+salvo = { version = "*", features = ["oapi"] }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.80"
+lazy_static = "1.4.0"
+tokio-util = "*"
+reqwest = { version = "0.10", features = ["blocking"] }
+toml = "0.5.11"
+once_cell = "*"
+
+[lib]
+path = "src/main.rs"
